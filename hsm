@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+  #=======================================
+  # Project: hsm / v1.0
+  # Author:  ConzZah / (c) 2025
+  # Last Modification: 14.08.25 / 16:20
+  #=======================================
+
+### /// hsm is a minimal nmcli-based hotspot manager /// ###
+
+### refuse to launch entirely if nmcli wasn't found
+! command -v nmcli &>/dev/null && { echo "PLEASE INSTALL NETWORKMANAGER FIRST." && exit 1 ;}
+
+logo () {
+echo -e '
+                        888
+                        888
+                        888
+                        88888b.  .d8888b  88888b.d88b.
+                        888 "88b 88K      888 "888 "88b
+                        888  888 "Y8888b. 888  888  888
+                        888  888      X88 888  888  888
+                        888  888  88888P ' '888  888  888\n' ;}
+
+### doso ###
+## if user doesn't happen to be root,
+## check if sudo / doas are available and set it, else echo error & exit 1
+## should user be root, leave "$doso" empty
+doso=""; [[ "$UID" != "0" || -z "$UID" ]] && \
+{ command -v sudo >/dev/null && doso="sudo"
+[ -z "$doso" ] && command -v doas >/dev/null && doso="doas"
+[ -z "$doso" ] && { echo -e "--> ERROR: SUDO / DOAS NOT FOUND."; exit 1 ;} ;}
+
+######## MAIN FUNCTIONS ######## MAIN FUNCTIONS ######## MAIN FUNCTIONS ######## MAIN FUNCTIONS ######## MAIN FUNCTIONS ########
+
+help () {
+### hsm's help page
+echo -e "         /// hsm v1.0 // Author: ConzZah (c) 2025 // LICENSE: MIT ///\n
+USAGE: hsm [OPTION]
+OPTIONS:\n
+h,      --help                              show this help and exit\n
+s,      --status                            show hotspot status\n
+e,      --enable                            enable hotspot\n
+d,      --disable                           disable hotspot\n
+th,     --toggle-hidden                     change hotspot visibility\n
+pw,     --view-pw                           view hotspot password\n
+chpw,   --change-pw                         change hotspot password\n
+chssid, --change-ssid                       change hotspot ssid\n
+--restore-default [wifi/eth]                restores default values\n" ;}
+
+### if help has been requested or if "$1" is blank, show help & exit
+if [[ "$1" =~ ^(h|"--help"|"")$ ]]; then logo; help; exit "$?"; fi
+
+hs_status () {
+### fetch hotspot status / load profile
+## only show info when requested
+[ "$1" = "--verbose" ] && [ -n "$hss" ] && { echo -e "\nCON:    $hsn\nSTATE:  ${hss^^}\nHIDDEN: ${hs_hidden^^}\n" && return 0 || return 1 ;}
+## check if an nmcli profile, for hs_uuid, exists
+[ -n "$hs_uuid" ] && nmcli -t c| { ! grep -q "$hs_uuid" ;} && \
+## ^^^^ should grep fail, then the nmcli-profile doesn't exist (anymore), but the uuid entry is still present.
+## in which case we delete the line containing the (now useless) uuid (if it exists) and exit:
+{ line="$(grep -n "$mode" "$uuidfile"| cut -b 1)"; [ -n "$line" ] && sed -i "${line}d" "$uuidfile"
+echo -e "\n--> ERROR: NMCLI PROFILE FOR ${mode^^} COULDN'T BE FOUND.\n"
+[ -z "$restore_default" ] && echo -e "you might wanna run: \n\nbash hsm --restore-default $mode\n"; exit 1 ;}
+## if we're still alive,
+## load "$profile" of the selected uuid:
+[ -n "$hs_uuid" ] && { profile="$($doso nmcli -t -s c s "$hs_uuid")"
+hsn="$(grep -s "connection.id" <<< "$profile"| cut -d ':' -f 2)"
+[ "$mode" = "wifi" ] && hs_hidden="$(grep -s "802-11-wireless.hidden" <<< "$profile"| cut -d ':' -f 2)"
+nmcli -t c s --active| grep -q "$hs_uuid" && hss="activated" || hss="deactivated" ;} # <-- $hss returns either activated or deactivated
+}
+
+hs_enable () { x="e"
+### enable_hotspot
+## check if hotspot is already enabled
+[ "$hss" = "activated" ] && echo -e "\n--> HOTSPOT ALREADY ENABLED \n" && return 0
+## run inetcheck, ufw_trigger and enable the hotspot
+inetcheck; ufw_trigger
+[ "$mode" = "eth" ] && $doso nmcli device disconnect "$eth_ifname" &>/dev/null
+! $doso nmcli c u "$hs_uuid" && echo -e "\n--> ERROR: HOTSPOT COULDN'T BE ENABLED \n" && return 1 \
+|| echo -e "\n--> HOTSPOT ENABLED\n" && return 0
+}
+
+hs_disable () { x="d"
+### disable_hotspot
+## check if hotspot is already disabled
+[ "$hss" = "deactivated" ] && echo -e "\n--> HOTSPOT ALREADY DISABLED \n" && return 0
+! $doso nmcli c d "$hs_uuid" && { echo -e "\n--> ERROR: HOTSPOT COULDN'T BE DISABLED \n"; return 1 ;} \
+|| ufw_trigger && echo -e "\n--> HOTSPOT DISABLED\n" && return 0 
+}
+
+vhspw () {
+### view hotspot password
+[ "$mode" = eth ] && echo -e "\n${mode^^} DOESN'T NEED A PASSWORD.\n" && return 0
+hspw="$(grep "802-11-wireless-security.psk" <<< "$profile"| head -n 1| cut -d ':' -f 2)"
+echo -e "\nSSID: $hsn \tPASS: $hspw \tHIDDEN: $hs_hidden\n"
+## if qrencode is installed, show qr code:
+command -v qrencode >/dev/null && \
+{ [ "$hs_hidden" = "yes" ] && hs_hidden="true" || hs_hidden="" # <-- change "$hs_hidden" to true if yes or empty if no (so the qr code works)
+echo "WIFI:S:$hsn;T:WPA;P:$hspw;H:$hs_hidden;;"| qrencode -t UTF8; echo "" ;}
+}
+
+chspw () {
+### change hotspot password
+[ "$mode" = eth ] && echo -e "\n${mode^^} DOESN'T NEED A PASSWORD.\n" && return 0
+new_hspw=""; echo -e "\nENTER NEW HOTSPOT PASSWORD (will not echo)\n"; read -r -s new_hspw
+[ "${#new_hspw}" -lt "8" ] && { echo -e "\n--> ERROR: PASSWORD NEEDS AT LEAST 8 CHARS."; chspw ;}
+$doso nmcli c m "$hsn" wifi-sec.psk "$new_hspw" && echo -e "\nPASSWORD CHANGED!\n"
+}
+
+# change hotspot ssid & profile name
+chsssid () { echo -e "\nENTER NEW HOTSPOT SSID:"; read -r ssid; $doso nmcli c m "$hsn" ssid "$ssid"; $doso nmcli c m "$hsn" c.id "$ssid"; hsn="$ssid" ;}
+
+toggle_hidden () {
+### toggle network discoverability
+[ "$mode" = eth ] && echo -e "\nCAN'T CHANGE VISIBILITY FOR ${mode^^}.\n" && return 0
+[ "$hs_hidden" = "yes" ] && $doso nmcli c m "$hs_uuid" 802-11-wireless.hidden "no" && hs_hidden="DISCOVERABLE"
+[ "$hs_hidden" = "no" ] && $doso nmcli c m "$hs_uuid" 802-11-wireless.hidden "yes" && hs_hidden="HIDDEN"
+echo -e "\n--> HOTSPOT SSID IS NOW $hs_hidden.\n"
+}
+
+######## BACKEND FUNCTIONS ######## BACKEND FUNCTIONS ######## BACKEND FUNCTIONS ######## BACKEND FUNCTIONS ######## BACKEND FUNCTIONS ########
+
+load_defaults () {
+### assign default values to variables
+mode="${mode:-wifi}" # <-- default operation mode (wifi if unset)
+hsn="wifi-ap" # <-- default wifi con name & ssid [accepted value: any]
+ethsn="eth-ap" # <-- default eth con name [accepted value: any]
+hspw="password1234" # <-- default wifi password  [accepted value: any if over 8 chars]
+hs_hidden="no" # <-- default hotspot visibility [accepted value: yes/no]
+hs_autoconnect="no" # <-- default autoconnect state [accepted value: yes/no]
+wifi_ifname="wlan0" # <-- default interface for wifi hotspot
+eth_ifname="eth0" # <-- default interface for ethernet bridge
+}
+
+add_ufw_rules () {
+### if ufw is installed, add rules to allow hotspot traffic
+## (will only be called in initial_setup).
+[ -n "$noufw" ] && return 0 # <-- should ufw not be installed, return.
+$doso ufw allow bootps # <-- DHCP
+$doso ufw allow 53/udp # <-- DNS
+$doso ufw allow 53/tcp
+$doso ufw reload
+}
+
+ufw_trigger () {
+### changes ufw's default forward policy to accept or drop
+### (depending on if we're enabling or disabling the ap)
+[ -n "$noufw" ] && return 0
+cfg="/etc/default/ufw"
+dfp="DEFAULT_FORWARD_POLICY="
+a="$dfp\"ACCEPT\""; d="$dfp\"DROP\""
+[ "$x" = "e" ] && $doso sed -i "s/$d/$a/g" "$cfg"
+[ "$x" = "d" ] && $doso sed -i "s/$a/$d/g" "$cfg"
+$doso ufw reload && return 0 || return 1
+}
+
+probe_wifi_interfaces () {
+### find out if at least one wifi interface on this system is capable of ap mode and assign it's ifname.
+## returns all avilable wifi interfaces, except p2p, seperated by spaces.
+wifi_ifaces="$(nmcli -t dev| grep wifi| sed 's/p2p-dev-.*//g'| cut -d ':' -f 1| tr '\n' ' '| tr -s ' ')"
+
+for iface in $wifi_ifaces; do
+wifi_ap_capability="$(nmcli -f WIFI-PROPERTIES.AP device show "$iface"| tr -s ' '| cut -d ' ' -f 2)" # <--  returns either yes or no.
+## should $wifi_ap_capability return yes, set the $ap_iface and break out of the loop, else continue until none remain.
+[ "$wifi_ap_capability" = "yes" ] && { ap_iface="$iface"; wifi_ifname="$iface"; break ;}
+[ "$wifi_ap_capability" = "no" ] && :
+done
+## if "$ap_iface" is empty after the loop, it means that no suitable interface was found.
+[ -z "$ap_iface" ] && echo -e "\n--> ERROR: FAILED TO FIND ANY WIFI CARD CAPABLE OF AP-MODE.\n" && \
+[ -n "$xp" ] && return 0 # <-- note: $xp only gets set when we call --restore-default wifi explicitly. 
+## if uuid is set, get the saved interface name from the ap connection profile and check if it's the same as the detected one:
+## should it not be the same, modify it to use the $ap_iface, so one can connect to it: 
+[ -n "$hs_uuid" ] && { saved_wifi_interface="$(nmcli -t c s "$hs_uuid"| grep "interface"| cut -d ':' -f 2)"
+[[ "$ap_iface" != "$saved_wifi_interface" ]] && $doso nmcli c m "$hs_uuid" ifname "$ap_iface" ;}
+}
+
+probe_eth_interfaces () { 
+### find any ethernet interfaces and check what state they are in
+# ( if state is -lt 100 we lock in )
+eth_ifaces="$(nmcli -t dev| grep ethernet| cut -d : -f 1| tr '\n' ' ')"
+[ -z "$eth_ifaces" ] && [ -z "$restore_default" ] && \
+{ echo -e "\n--> ERROR: FAILED TO FIND ANY ETHERNET INTERFACE.\n"; exit 1 ;}
+[ -n "$eth_ifaces" ] && \
+{ for iface in $eth_ifaces; do 
+iface_state="$(nmcli -t device show "$iface"| grep STATE| cut -d : -f 2| cut -b 1-3| sed 's# ##g')"
+[ "$iface_state" -lt "100" ] && eth_ifname="$iface" && ap_iface="$eth_ifname" && break
+done
+## if a uuid has been loaded, modify the interface, shouldn't it be the same:
+[ -n "$hs_uuid" ] && \
+{ saved_eth_iface="$(nmcli -t c s "$hs_uuid"| grep interface| cut -d : -f 2)"
+[ "$iface" != "$saved_eth_iface" ] && $doso nmcli c m "$hs_uuid" ifname "$eth_ifname" ;} ;}
+}
+
+inetcheck () {
+### checks if any interface is connected to the internet
+inet_iface=""; echo -e "\nCHECKING INTERNET CONNECTION..\n"
+all_active_interfaces="$(nmcli -t c s --active| sed 's/lo.*//g'| cut -d ':' -f 4| tr '\n' ' '| tr -s ' ')"
+### ^ ^ ^ returns active interfaces (except loopback) seperated by spaces
+## loops through every available interface, and breaks out once the ping to quad9 is successful
+# I = interface to use, W = time to wait for response, c = count of pings to send, s = size of packets per ping in bytes 
+interface=""; for interface in $all_active_interfaces; do
+if ! ping -I "$interface" -W 1 -c 1 -s 1 "quad9.net" >/dev/null; then :
+else inet_iface="$interface" && break; fi
+done
+[ -z "$inet_iface" ] && echo -e "\n--> WARNING: NO INTERNET CONNECTION AVAILABLE. \n\nHOTSPOT WILL ONLY RUN LOCALLY.\n"
+[ -n "$inet_iface" ] && echo "INET IFACE: $inet_iface"
+## if ap and inet interface are NOT the same, there's nothing more to do, so we return 0.
+[ "$inet_iface" != "$ap_iface" ] && \
+echo -e "AP   IFACE: $ap_iface\n" && return 0
+## however, if inet and ap interface ARE the same, echo error and exit
+if [ "$inet_iface" = "$ap_iface" ]; then echo -e "\n--> ERROR: '$ap_iface' CAN'T PROVIDE AP AND ACCESS THE INTERNET SIMULTANEOUSLY.\n"; exit 1; fi
+}
+
+install_nmcli_profiles () {
+### install / restore nmcli connection profiles
+## install default wifi ap profile only if we have a working interface
+wifi () { mode="wifi"; delete_uuid_if_exist; probe_wifi_interfaces; [ -n "$ap_iface" ] && \
+{ $doso nmcli c a type wifi ifname "$wifi_ifname" con-name "$hsn" autoconnect "$hs_autoconnect" ssid "$hsn"
+$doso nmcli c m "$hsn" 802-11-wireless.mode ap 802-11-wireless.band bg ipv4.method shared
+$doso nmcli c m "$hsn" wifi-sec.key-mgmt wpa-psk wifi-sec.pairwise ccmp wifi-sec.proto rsn
+$doso nmcli c m "$hsn" wifi-sec.psk "$hspw" 802-11-wireless.hidden "$hs_hidden"
+chsssid; echo -e "\nPLS CHANGE THE DEFAULT PASSWORD\n"; chspw ;} # <-- asks user for hotspot ssid & password
+}
+## install default eth ap profile
+eth () { mode="eth"; delete_uuid_if_exist
+probe_eth_interfaces; [ -n "$ap_iface" ] && \
+$doso nmcli c add con-name "$ethsn" type ethernet ifname "$eth_ifname" ipv4.method shared ipv6.method ignore autoconnect "$hs_autoconnect"
+}
+### checks if a uuid/profile exist & deletes it, if it already does
+delete_uuid_if_exist () { load_uuid; [ -n "$hs_uuid" ] && { nmcli c | grep "$hs_uuid" >/dev/null && $doso nmcli c del "$hs_uuid"; hs_uuid=""; return 0 ;} || return 1
+}
+## if $restore_default is set, add ufw rules and default profiles.
+[ -n "$restore_default" ] && [ -z "$1" ] && { add_ufw_rules; wifi; eth ;}
+if [[ "$1" =~ ^(wifi|eth)$ ]]; then $1; elif [ "$1" = "ufw" ]; then add_ufw_rules; exit "$?"; fi
+}
+
+initial_setup () {
+### initial setup / uuid save function
+install_nmcli_profiles "$1"; [ -f "$uuidfile" ] && rm -f "$uuidfile" # <-- remove old uuidfile, should it still exist
+connections="$(nmcli -t c| sed -e 's#802-11-wireless#wifi#g' -e 's#802-3-ethernet#eth#g')"
+## save uuid(s) to uuidfile
+for hs_name in $hsn $ethsn; do
+[ -n "$hs_name" ] && hs_uuid="$(grep -s "$hs_name" <<< "$connections"| head -n1)"
+[ -n "$hs_uuid" ] && { mode="$(cut -d ':' -f 3 <<< "$hs_uuid")"; hs_uuid="$(cut -d ':' -f 2 <<< "$hs_uuid")"
+echo "$mode:$hs_uuid" >> "$uuidfile"; hs_uuid=""; hs_name=""; mode="" ;} done
+echo -e "\n--> CONNECTION SETUP DONE.\n"; exit
+}
+
+load_uuid () { 
+### loads uuid // exits with error on failure
+## uuidfiles are built like this: "mode:uuid"
+hs_uuid=""; hs_uuid="$(grep -s "$mode" "$uuidfile"| cut -d ':' -f 2)"
+[ -z "$hs_uuid" ] && [ -z "$restore_default" ] && { echo -e "\n--> ERROR: NO UUID FOUND FOR ${mode^^}\n"
+[ -z "$restore_default" ] && echo -e "you might wanna run: \n\nbash hsm --restore-default $mode\n"; return 1 ;} || return 0
+}
+
+######## INIT ######## INIT ######## INIT ######## INIT ######## INIT ######## INIT ######## INIT ######## INIT ######## INIT ######## INIT ########
+
+### create & cd to working directory
+wd="$HOME/.hsm"
+uuidfile="$wd/uuids"
+mkdir -p "$wd" && cd "$wd" || exit 1
+
+### if ufw isn't installed, set $noufw (disables ufw functions)
+[ ! -f "/usr/sbin/ufw" ] && noufw="1"
+
+### symlink iptables to /sbin/iptables if they aren't already.
+[ ! -L "/sbin/iptables" ] && $doso ln -s /usr/sbin/iptables /sbin/iptables
+
+### if mode was explicitly specified, (re)assign "$mode" and shift
+[[ "$1" =~ ^(wifi|eth)$ ]] && mode="$1" && shift
+
+load_defaults # <-- load default values, well.. by default.
+
+### (initial_setup trigger) if no uuidfile could be found or --restore-default was requested, run initial_setup (and forward mode if specified)
+[ ! -f "$uuidfile" ] || [ "$1" = "--restore-default" ] && { restore_default="1"; [ -z "$2" ] && initial_setup || [ -n "$2" ] && xp="$2" && initial_setup "$2" ;}
+
+### try to load uuid, should uuidfile exist
+[ -f "$uuidfile" ] && load_uuid
+
+### probe interfaces depending on mode and get hs_status before going further
+## we forward the first param because hs_status must know which mode we're going to use
+{ [[ ! "$1" =~ ^(s|"--status")$ ]] && probe_"${mode}"_interfaces; hs_status "$1" ;}
+
+### ARGUMENTS ###
+if [[ "$1" =~ ^(s|"--status")$ ]]; then hs_status "--verbose"; exit "$?"; fi
+if [[ "$1" =~ ^(e|"--enable")$ ]]; then hs_enable; exit "$?"; fi
+if [[ "$1" =~ ^(d|"--disable")$ ]]; then hs_disable; exit "$?"; fi
+if [[ "$1" =~ ^(th|"--toggle-hidden")$ ]]; then toggle_hidden; exit "$?"; fi
+if [[ "$1" =~ ^(pw|"--view-pw")$ ]]; then vhspw; exit "$?"; fi
+if [[ "$1" =~ ^(chpw|"--change-pw")$ ]]; then chspw; exit "$?"; fi
+if [[ "$1" =~ ^(chssid|"--change-ssid")$ ]]; then chsssid; exit "$?"; fi
+if [[ "$1" == * ]]; then logo; help; exit "$?"; fi
